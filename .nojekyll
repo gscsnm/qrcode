@@ -1,5 +1,1 @@
-# 在项目根创建空文件 .nojekyll
-touch .nojekyll
-git add .nojekyll
-git commit -m "Add .nojekyll to bypass Jekyll"
-git push
+
