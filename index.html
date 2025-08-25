@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>批量图书扫码（计数版） - 带重复确认</title>
+<title>批量图书扫码（手动摄像头选择）</title>
 
 <!-- html5-qrcode（首选） -->
 <script src="https://unpkg.com/html5-qrcode/minified/html5-qrcode.min.js"></script>
-<!-- zxing 作为备用（保留） -->
+<!-- zxing 备用 -->
 <script src="https://unpkg.com/@zxing/browser@latest"></script>
 
 <style>
@@ -22,25 +22,37 @@
   .small{font-size:0.85rem;color:#666}
   .status{margin-top:8px;color:#0b84ff}
   .err{color:#c00}
+  /* Modal */
+  .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:9999}
+  .modal{background:#fff;padding:14px;border-radius:8px;max-width:90%;width:420px;box-shadow:0 6px 18px rgba(0,0,0,0.2)}
+  .modal h3{margin:0 0 8px 0;font-size:1rem}
+  .modal p{margin:8px 0;font-size:0.95rem}
+  .modal .actions{display:flex;gap:10px;justify-content:flex-end;margin-top:12px}
+  .pill{padding:6px 8px;border-radius:999px;border:1px solid #ddd;background:#fafafa}
+  .camera-row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+  select, input{padding:8px}
 </style>
 </head>
 <body>
-  <h1>📚 批量扫码并计数（含重复确认）</h1>
-  <div class="small">说明：请确保页面通过 HTTPS 访问（GitHub Pages / Netlify），并允许浏览器使用相机权限。</div>
+  <h1>📚 批量扫码并计数（手动摄像头选择）</h1>
+  <div class="small">通过 HTTPS 打开（GitHub Pages / Netlify），并允许摄像头权限。先刷新相机，再选择你想用的摄像头。</div>
 
-  <div class="controls">
+  <div class="controls" style="margin-top:8px">
+    <div class="camera-row">
+      <button id="refreshCams" class="btn">刷新相机</button>
+      <select id="cameraSelect" style="min-width:220px"><option value="">（尚未选择）</option></select>
+    </div>
+
     <button id="startBtn" class="btn primary">开始扫码</button>
     <button id="stopBtn" class="btn">停止扫码</button>
     <button id="undoBtn" class="btn">撤销上一次</button>
     <button id="clearBtn" class="btn">清空全部</button>
-    <label style="display:flex;align-items:center;gap:6px"><input id="dupAllow" type="checkbox" checked> 允许快速重复计数</label>
-    <label style="display:flex;align-items:center;gap:6px"><input id="autoFetch" type="checkbox" checked> 自动抓 OpenLibrary 信息</label>
+    <label class="pill"><input id="dupAllow" type="checkbox" checked> 允许快速重复计数</label>
+    <label class="pill"><input id="autoFetch" type="checkbox" checked> 自动抓 OpenLibrary</label>
   </div>
 
   <div style="max-width:480px;margin:0 auto">
-    <!-- html5-qrcode 容器（首选） -->
-    <div id="reader" style="width:100%;"></div>
-    <!-- 备用：zxing 视频元素（仅在 zxing 启动时使用） -->
+    <div id="reader"></div>
     <video id="video" autoplay playsinline style="display:none;width:100%;"></video>
   </div>
 
@@ -66,11 +78,15 @@
     <button id="downloadTxt" class="btn">下载条码 TXT（barcode,count）</button>
   </div>
 
+  <!-- Modal DOM（默认隐藏） -->
+  <div id="modalRoot" style="display:none"></div>
+
 <script>
-/* 数据存储 */
+/* state */
 const counts = new Map();
 const events = [];
 const lastScanAt = new Map();
+const pendingConfirm = new Set();
 const DEBOUNCE_MS = 700;
 
 let allowQuickDup = true;
@@ -83,7 +99,9 @@ const errorEl = document.getElementById('error');
 const readerDiv = document.getElementById('reader');
 const videoElem = document.getElementById('video');
 const tbody = document.querySelector('#tb tbody');
+const cameraSelect = document.getElementById('cameraSelect');
 
+document.getElementById('refreshCams').addEventListener('click', refreshCameras);
 document.getElementById('startBtn').addEventListener('click', startScanner);
 document.getElementById('stopBtn').addEventListener('click', stopScanner);
 document.getElementById('undoBtn').addEventListener('click', undoLast);
@@ -100,57 +118,65 @@ function setError(e){ errorEl.textContent = '错误：' + e; statusEl.textConten
 
 function nowISO(){ return new Date().toISOString(); }
 
-/*
- handleScanned: 
-  - short debounce to avoid repeated frame triggers
-  - if barcode already exists -> prompt 用户确认是否增加 (confirm)
-  - else create new record
-*/
+/* 非阻塞确认 modal */
+function showConfirmAsync(title, message){
+  return new Promise(resolve => {
+    const root = document.getElementById('modalRoot');
+    root.innerHTML = '';
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.innerHTML = `<h3>${escapeHtml(title)}</h3><p>${escapeHtml(message)}</p>`;
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    const btnCancel = document.createElement('button');
+    btnCancel.className = 'btn'; btnCancel.textContent = '取消';
+    const btnOk = document.createElement('button');
+    btnOk.className = 'btn primary'; btnOk.textContent = '确定';
+    actions.appendChild(btnCancel); actions.appendChild(btnOk);
+    modal.appendChild(actions);
+    backdrop.appendChild(modal);
+    root.appendChild(backdrop);
+    root.style.display = 'block';
+    btnOk.onclick = ()=>{ root.innerHTML=''; root.style.display='none'; resolve(true); };
+    btnCancel.onclick = ()=>{ root.innerHTML=''; root.style.display='none'; resolve(false); };
+    backdrop.onclick = (ev)=>{ if(ev.target === backdrop){ root.innerHTML=''; root.style.display='none'; resolve(false);} };
+  });
+}
+
+/* handle scanned */
 async function handleScanned(raw){
   const code = String(raw).replace(/\s+/g,'');
   const t = Date.now();
-
-  // debounce for same code to avoid many frames causing repeated prompts
   const last = lastScanAt.get(code) || 0;
-  if(!allowQuickDup && t - last < DEBOUNCE_MS){
-    return;
-  }
-  // mark last scan time immediately to avoid prompt storms even if user cancels
+  if(!allowQuickDup && t - last < DEBOUNCE_MS) return;
   lastScanAt.set(code, t);
 
   if(counts.has(code)){
-    // 已存在：弹框确认
-    try {
-      // use native confirm (synchronous) for simplicity and immediate UX
-      const titlePreview = counts.get(code).title ? `（已记录标题：${counts.get(code).title}）` : '';
-      const ok = window.confirm(`检测到重复条码：${code} ${titlePreview}\n是否将数量 +1？\n\n点击“确定”增加，点击“取消”忽略此次扫码。`);
+    if(pendingConfirm.has(code)) return;
+    pendingConfirm.add(code);
+    const rec = counts.get(code);
+    const titlePreview = rec && rec.title ? `（已记录: ${rec.title}）` : '';
+    try{
+      const ok = await showConfirmAsync('重复条码', `检测到重复条码：${code} ${titlePreview}\n是否把数量 +1？`);
+      pendingConfirm.delete(code);
       if(ok){
-        const rec = counts.get(code);
-        rec.count += 1;
-        rec.last = nowISO();
-        events.push({ barcode: code, time: nowISO() });
-        // optionally refetch metadata if not present - skipped here
-        renderTable();
+        rec.count += 1; rec.last = nowISO(); events.push({barcode: code, time: nowISO()}); renderTable();
       } else {
-        // 用户取消：不计数（已更新 lastScanAt 以避免立刻再次弹窗）
+        // canceled
       }
     } catch(e){
-      // 若浏览器不支持 confirm（极少），则默认增加
-      const rec = counts.get(code);
-      rec.count += 1;
-      rec.last = nowISO();
-      events.push({ barcode: code, time: nowISO() });
-      renderTable();
+      pendingConfirm.delete(code);
     }
     return;
   }
 
-  // 新条码：直接添加
+  // add new
   counts.set(code, { count: 1, first: nowISO(), last: nowISO() });
   events.push({ barcode: code, time: nowISO() });
   renderTable();
 
-  // 自动抓取 OpenLibrary（非阻塞）
   if(document.getElementById('autoFetch').checked){
     const isIsbn = /^\d{10}$|^\d{13}$/.test(code.replace(/[^0-9Xx]/g,''));
     if(isIsbn){
@@ -168,6 +194,7 @@ async function handleScanned(raw){
   }
 }
 
+/* render */
 function renderTable(){
   tbody.innerHTML = '';
   let i=0;
@@ -225,7 +252,7 @@ function clearAll(){
   counts.clear(); events.length = 0; renderTable();
 }
 
-/* 导出 */
+/* exports */
 function downloadSummaryCSV(){
   const header = ['barcode','count','first_seen','last_seen'];
   let csv = header.join(',') + '\n';
@@ -253,48 +280,79 @@ function downloadBlob(content, filename, type){
 }
 function escapeHtml(s){ if(!s) return ''; return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); }
 
-/* 启动扫描：优先 html5-qrcode；失败则尝试 zxing */
+/* ==== 摄像头列表刷新（手动） ==== */
+async function refreshCameras(){
+  setError('');
+  setStatus('请求摄像头权限并刷新列表...');
+  try {
+    // 请求权限 briefly to make labels available
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    // immediately stop tracks (we only needed permission/labels)
+    stream.getTracks().forEach(t => t.stop());
+  } catch(e){
+    // permission denied or other; still try enumerateDevices (labels may be empty)
+    console.warn('getUserMedia failed or denied:', e);
+  }
+  try{
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d => d.kind === 'videoinput');
+    cameraSelect.innerHTML = '';
+    if(!cams.length){ cameraSelect.appendChild(new Option('无摄像头','')); setStatus('未检测到摄像头'); return; }
+    cameraSelect.appendChild(new Option('（请选择）',''));
+    cams.forEach(c=>{
+      const label = c.label || c.deviceId;
+      const opt = new Option(label, c.deviceId);
+      cameraSelect.appendChild(opt);
+    });
+    setStatus('已刷新相机列表');
+  }catch(e){
+    setError('刷新摄像头列表失败：' + (e && e.message ? e.message : e));
+  }
+}
+
+/* 启动扫描：使用用户在下拉中选择的 deviceId（首选 html5-qrcode，其次 ZXing） */
 async function startScanner(){
   if(scanning){ setStatus('已在扫描中'); return; }
   setError('');
+  const selectedId = cameraSelect.value || null;
+  if(!selectedId){
+    if(!confirm('未选择具体摄像头，是否继续使用默认摄像头？（推荐先点击“刷新相机”并选择后置主摄）')){}
+  }
   setStatus('尝试启动摄像头（html5-qrcode 首选）...');
-  // html5-qrcode 启动流程
+  // stop any previous
+  stopScanner();
+
+  // try html5-qrcode
   try {
     if(typeof Html5Qrcode === 'undefined') throw new Error('Html5Qrcode 未加载');
+    const cams = await Html5Qrcode.getCameras(); // may return cameras with id,label
+    let camId = selectedId || (cams && cams.length ? cams[0].id : null);
+    if(!camId && cams && cams.length) camId = cams[0].id;
+    if(!camId) throw new Error('未找到可用摄像头');
     html5Qr = new Html5Qrcode("reader");
-    const cams = await Html5Qrcode.getCameras();
-    if(!cams || cams.length===0) throw new Error('未找到摄像头设备');
-    // 优先选后置（如果 label 存在 'back'/'rear'）
-    let camId = cams[0].id;
-    for(const c of cams){
-      const lab = (c.label||'').toLowerCase();
-      if(lab.includes('back') || lab.includes('rear') || lab.includes('后置')){ camId = c.id; break; }
-    }
     await html5Qr.start(camId, { fps: 10, qrbox: 250 },
       (decodedText) => { handleScanned(decodedText); },
-      (err) => { /* ignore frame errors */ }
+      (err) => { /* per-frame errors ignored */ }
     );
     scanning = true;
     setStatus('使用 html5-qrcode 扫描中');
     return;
   } catch(e){
     console.warn('html5-qrcode 启动失败：', e);
-    setStatus('html5-qrcode 启动失败，尝试备用 ZXing...');
+    setStatus('html5-qrcode 启动失败，尝试 ZXing...');
   }
 
-  // 备用 ZXing（如果加载且可用）
+  // fallback ZXing
   try {
-    const ZX = window.ZXing || window.ZXingBrowser || window.ZXingJs || null;
-    if(!ZX || !ZX.BrowserMultiFormatReader) {
-      if(window.ZXing && window.ZXing.BrowserMultiFormatReader) { /* ok */ }
-      else if(window.ZXingBrowser && window.ZXingBrowser.BrowserMultiFormatReader) { /* ok */ }
-      else throw new Error('ZXing 库不可用');
-    }
-    const codeReader = new (window.ZXing?.BrowserMultiFormatReader || window.ZXingBrowser?.BrowserMultiFormatReader || window.ZXing?.BrowserCodeReader)();
+    if(!window.ZXing && !window.ZXingBrowser) throw new Error('ZXing 未加载');
+    const codeReader = new ZXing.BrowserMultiFormatReader();
     zxingReader = codeReader;
-    const devices = await (window.ZXing?.BrowserCodeReader?.listVideoInputDevices?.() || window.ZXingBrowser?.BrowserCodeReader?.listVideoInputDevices?.() || codeReader.listVideoInputDevices?.());
-    let deviceId = devices && devices.length ? devices[devices.length-1].deviceId : undefined;
-    videoElem.style.display = '';
+    // list devices via ZXing (or navigator enumerateDevices)
+    const devices = await ZXing.BrowserCodeReader.listVideoInputDevices();
+    const cams = devices.map(d => ({ deviceId: d.deviceId, label: d.label || d.deviceId }));
+    const deviceId = selectedId || (cams.length ? cams[0].deviceId : undefined);
+    if(!deviceId) throw new Error('未找到可用摄像头（ZXing）');
+    document.getElementById('video').style.display = '';
     codeReader.decodeFromVideoDevice(deviceId, 'video', (result, err) => {
       if(result && result.getText) handleScanned(result.getText());
     });
@@ -303,7 +361,7 @@ async function startScanner(){
     return;
   } catch(e2){
     console.error('ZXing 启动失败：', e2);
-    setError('摄像头初始化失败，请确认页面为 HTTPS 并允许摄像头权限；或尝试在另一台设备/浏览器打开。具体错误：' + (e2 && e2.message ? e2.message : e2));
+    setError('摄像头初始化失败，请确认页面为 HTTPS 并允许摄像头权限；或尝试刷新相机并选择其他设备。错误：' + (e2 && e2.message ? e2.message : e2));
     scanning = false;
     return;
   }
@@ -316,12 +374,10 @@ function stopScanner(){
   if(zxingReader){
     try{ zxingReader.reset(); }catch(e){} zxingReader = null;
   }
-  videoElem.style.display = 'none';
+  document.getElementById('video').style.display = 'none';
   setStatus('已停止');
   scanning = false;
 }
-
-// 在页面关闭时停止
 window.addEventListener('beforeunload', ()=>{ try{ stopScanner(); }catch(e){} });
 
 </script>
