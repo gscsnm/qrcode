@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>图书条码扫描器 (ZXing + html5-qrcode Fallback)</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; margin: 20px; }
+    #video { width: 100%; max-width: 400px; }
+    #reader { width: 100%; max-width: 400px; margin: auto; display: none; }
+    #output { margin-top: 20px; font-size: 18px; }
+    #fallback { color: red; margin-top: 15px; }
+  </style>
+</head>
+<body>
+  <h2>📚 图书条码扫描器</h2>
+  <p>默认使用 ZXing，如果失败则自动切换到 html5-qrcode。</p>
+
+  <!-- ZXing 视频预览 -->
+  <video id="video" autoplay></video>
+
+  <!-- html5-qrcode 容器 -->
+  <div id="reader"></div>
+
+  <div id="output">扫描结果: <span id="result">无</span></div>
+  <div id="fallback"></div>
+
+  <!-- ZXing -->
+  <script src="https://unpkg.com/@zxing/library@latest"></script>
+  <!-- html5-qrcode -->
+  <script src="https://unpkg.com/html5-qrcode"></script>
+
+  <script>
+    const resultSpan = document.getElementById("result");
+    const videoElem = document.getElementById("video");
+    const readerElem = document.getElementById("reader");
+    const fallbackMsg = document.getElementById("fallback");
+
+    function startZXing() {
+      try {
+        const codeReader = new ZXing.BrowserBarcodeReader();
+        codeReader.decodeFromVideoDevice(null, "video", (result, err) => {
+          if (result) {
+            resultSpan.textContent = result.getText();
+          }
+        }).catch((err) => {
+          console.error("ZXing 初始化失败，切换 fallback:", err);
+          startHtml5Qrcode();
+        });
+      } catch (e) {
+        console.error("ZXing 异常:", e);
+        startHtml5Qrcode();
+      }
+    }
+
+    function startHtml5Qrcode() {
+      videoElem.style.display = "none";  // 隐藏 zxing 视频
+      readerElem.style.display = "block";
+      fallbackMsg.textContent = "⚠️ ZXing 失败，已切换到 html5-qrcode";
+
+      const html5QrCode = new Html5Qrcode("reader");
+      Html5Qrcode.getCameras().then(devices => {
+        if (devices && devices.length) {
+          const cameraId = devices[0].id;
+          html5QrCode.start(
+            cameraId,
+            { fps: 10, qrbox: 250 },
+            (decodedText) => {
+              resultSpan.textContent = decodedText;
+            },
+            (errorMessage) => {
+              // 这里可以忽略错误日志
+            }
+          ).catch(err => {
+            console.error("html5-qrcode 启动失败:", err);
+            fallbackMsg.textContent = "❌ ZXing 和 html5-qrcode 都无法工作";
+          });
+        }
+      }).catch(err => {
+        console.error("获取摄像头失败:", err);
+        fallbackMsg.textContent = "❌ 无法访问摄像头";
+      });
+    }
+
+    // 启动
+    window.addEventListener("load", startZXing);
+  </script>
+</body>
+</html>
