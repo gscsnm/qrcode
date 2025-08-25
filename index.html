@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>批量图书扫码（计数版） - 修复版</title>
+<title>批量图书扫码（计数版） - 带重复确认</title>
 
 <!-- html5-qrcode（首选） -->
 <script src="https://unpkg.com/html5-qrcode/minified/html5-qrcode.min.js"></script>
@@ -25,7 +25,7 @@
 </style>
 </head>
 <body>
-  <h1>📚 批量扫码并计数（修复版）</h1>
+  <h1>📚 批量扫码并计数（含重复确认）</h1>
   <div class="small">说明：请确保页面通过 HTTPS 访问（GitHub Pages / Netlify），并允许浏览器使用相机权限。</div>
 
   <div class="controls">
@@ -56,7 +56,7 @@
   </div>
 
   <table id="tb" style="margin-top:14px;max-width:960px">
-    <thead><tr><th>#</th><th>条码</th><th>数量</th><th>首次扫描</th><th>最近扫描</th><th>操作</th></tr></thead>
+    <thead><tr><th>#</th><th>条码</th><th>数量</th><th>首次扫描</th><th>最近扫描（与书名/作者）</th><th>操作</th></tr></thead>
     <tbody></tbody>
   </table>
 
@@ -100,26 +100,57 @@ function setError(e){ errorEl.textContent = '错误：' + e; statusEl.textConten
 
 function nowISO(){ return new Date().toISOString(); }
 
-function handleScanned(raw){
+/*
+ handleScanned: 
+  - short debounce to avoid repeated frame triggers
+  - if barcode already exists -> prompt 用户确认是否增加 (confirm)
+  - else create new record
+*/
+async function handleScanned(raw){
   const code = String(raw).replace(/\s+/g,'');
   const t = Date.now();
-  if(!allowQuickDup){
-    const last = lastScanAt.get(code) || 0;
-    if(t - last < DEBOUNCE_MS) return;
+
+  // debounce for same code to avoid many frames causing repeated prompts
+  const last = lastScanAt.get(code) || 0;
+  if(!allowQuickDup && t - last < DEBOUNCE_MS){
+    return;
   }
+  // mark last scan time immediately to avoid prompt storms even if user cancels
   lastScanAt.set(code, t);
 
-  const rec = counts.get(code);
-  if(rec){
-    rec.count += 1;
-    rec.last = nowISO();
-  } else {
-    counts.set(code, { count: 1, first: nowISO(), last: nowISO() });
+  if(counts.has(code)){
+    // 已存在：弹框确认
+    try {
+      // use native confirm (synchronous) for simplicity and immediate UX
+      const titlePreview = counts.get(code).title ? `（已记录标题：${counts.get(code).title}）` : '';
+      const ok = window.confirm(`检测到重复条码：${code} ${titlePreview}\n是否将数量 +1？\n\n点击“确定”增加，点击“取消”忽略此次扫码。`);
+      if(ok){
+        const rec = counts.get(code);
+        rec.count += 1;
+        rec.last = nowISO();
+        events.push({ barcode: code, time: nowISO() });
+        // optionally refetch metadata if not present - skipped here
+        renderTable();
+      } else {
+        // 用户取消：不计数（已更新 lastScanAt 以避免立刻再次弹窗）
+      }
+    } catch(e){
+      // 若浏览器不支持 confirm（极少），则默认增加
+      const rec = counts.get(code);
+      rec.count += 1;
+      rec.last = nowISO();
+      events.push({ barcode: code, time: nowISO() });
+      renderTable();
+    }
+    return;
   }
+
+  // 新条码：直接添加
+  counts.set(code, { count: 1, first: nowISO(), last: nowISO() });
   events.push({ barcode: code, time: nowISO() });
   renderTable();
 
-  // optional auto fetch info (non-blocking)
+  // 自动抓取 OpenLibrary（非阻塞）
   if(document.getElementById('autoFetch').checked){
     const isIsbn = /^\d{10}$|^\d{13}$/.test(code.replace(/[^0-9Xx]/g,''));
     if(isIsbn){
@@ -129,10 +160,10 @@ function handleScanned(raw){
           const key = `ISBN:${code}`;
           if(js && js[key]){
             const info = js[key];
-            const rec2 = counts.get(code);
-            if(rec2){ rec2.title = info.title || ''; rec2.authors = (info.authors||[]).map(a=>a.name).join(', '); renderTable(); }
+            const rec = counts.get(code);
+            if(rec){ rec.title = info.title || ''; rec.authors = (info.authors||[]).map(a=>a.name).join(', '); renderTable(); }
           }
-        }).catch(()=>{ /* ignore */ });
+        }).catch(()=>{});
     }
   }
 }
@@ -197,21 +228,21 @@ function clearAll(){
 /* 导出 */
 function downloadSummaryCSV(){
   const header = ['barcode','count','first_seen','last_seen'];
-  let csv = header.join(',') + '\\n';
+  let csv = header.join(',') + '\n';
   for(const [b, r] of counts.entries()){
-    csv += [b, r.count, r.first||'', r.last||''].map(csvEscape).join(',') + '\\n';
+    csv += [b, r.count, r.first||'', r.last||''].map(csvEscape).join(',') + '\n';
   }
   downloadBlob(csv, `books_summary_${(new Date()).toISOString().slice(0,10)}.csv`, 'text/csv;charset=utf-8;');
 }
 function downloadEventsCSV(){
   const header = ['barcode','time'];
-  let csv = header.join(',') + '\\n';
-  events.forEach(e=>{ csv += [e.barcode, e.time].map(csvEscape).join(',') + '\\n'; });
+  let csv = header.join(',') + '\n';
+  events.forEach(e=>{ csv += [e.barcode, e.time].map(csvEscape).join(',') + '\n'; });
   downloadBlob(csv, `books_events_${(new Date()).toISOString().slice(0,10)}.csv`, 'text/csv;charset=utf-8;');
 }
 function downloadTxtFile(){
   let txt = '';
-  for(const [b, r] of counts.entries()) txt += `${b},${r.count}\\n`;
+  for(const [b, r] of counts.entries()) txt += `${b},${r.count}\n`;
   downloadBlob(txt, `books_${(new Date()).toISOString().slice(0,10)}.txt`, 'text/plain');
 }
 function csvEscape(v){ if(v==null) return '""'; const s = String(v).replaceAll('"','""'); return `"${s}"`; }
@@ -220,7 +251,7 @@ function downloadBlob(content, filename, type){
   const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
   URL.revokeObjectURL(url);
 }
-function escapeHtml(s){ if(!s) return ''; return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('\"','&quot;'); }
+function escapeHtml(s){ if(!s) return ''; return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); }
 
 /* 启动扫描：优先 html5-qrcode；失败则尝试 zxing */
 async function startScanner(){
@@ -255,20 +286,15 @@ async function startScanner(){
   try {
     const ZX = window.ZXing || window.ZXingBrowser || window.ZXingJs || null;
     if(!ZX || !ZX.BrowserMultiFormatReader) {
-      // try import namespace from '@zxing/browser' global
       if(window.ZXing && window.ZXing.BrowserMultiFormatReader) { /* ok */ }
       else if(window.ZXingBrowser && window.ZXingBrowser.BrowserMultiFormatReader) { /* ok */ }
       else throw new Error('ZXing 库不可用');
     }
-    // 使用 @zxing/browser 的标准实例
     const codeReader = new (window.ZXing?.BrowserMultiFormatReader || window.ZXingBrowser?.BrowserMultiFormatReader || window.ZXing?.BrowserCodeReader)();
     zxingReader = codeReader;
-    // 获取设备列表
     const devices = await (window.ZXing?.BrowserCodeReader?.listVideoInputDevices?.() || window.ZXingBrowser?.BrowserCodeReader?.listVideoInputDevices?.() || codeReader.listVideoInputDevices?.());
     let deviceId = devices && devices.length ? devices[devices.length-1].deviceId : undefined;
-    // 显示视频元素 for zxing
     videoElem.style.display = '';
-    // decodeFromVideoDevice 接口
     codeReader.decodeFromVideoDevice(deviceId, 'video', (result, err) => {
       if(result && result.getText) handleScanned(result.getText());
     });
@@ -290,7 +316,6 @@ function stopScanner(){
   if(zxingReader){
     try{ zxingReader.reset(); }catch(e){} zxingReader = null;
   }
-  // 隐藏 video / 恢复 reader 显示控制（html5 reader 显示在 reader 元素）
   videoElem.style.display = 'none';
   setStatus('已停止');
   scanning = false;
